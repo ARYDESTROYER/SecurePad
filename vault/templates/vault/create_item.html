@@ -1,0 +1,93 @@
+{% extends 'vault/base.html' %}
+
+{% block title %}Create Item — SecurePad{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col-md-8">
+    <div class="card shadow-sm">
+      <div class="card-body">
+        <h3 class="mb-3">Create Item</h3>
+        <form id="create-form" method="post">
+          {% csrf_token %}
+          {{ form.as_p }}
+          <div class="form-check mb-3 d-flex align-items-center">
+            <input class="form-check-input" type="checkbox" value="1" id="clientEncrypt" {% if not dek_present %} disabled {% endif %}>
+            <label class="form-check-label" for="clientEncrypt">Encrypt on client before submit</label>
+            {% if not dek_present %}
+            <div class="ms-2 small text-muted">Client encryption requires your vault key.</div>
+            <button id="refresh-dek" class="btn btn-sm btn-link ms-auto">Check Vault Key</button>
+            {% endif %}
+          </div>
+          <input type="hidden" name="is_ciphertext" id="is_ciphertext" value="0">
+          <button class="btn btn-primary" type="submit">Create</button>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% block scripts %}
+{{ block.super }}
+  <script>
+  async function fetchDek() {
+  const r = await fetch('{% url "vault:get_raw_dek" %}');
+  if (!r.ok) {
+    // Attempt to provide a friendly message and fallback
+    const ek = await fetch('{% url "vault:get_encrypted_dek" %}');
+    if (ek.ok) {
+      // Encrypted DEK is available; show a message to instruct user to re-login to initialize vault
+      alert('Your vault is not initialized in this session. Please re-login to initialize your vault, or enable server-side encryption.');
+    } else {
+      alert('Could not fetch encryption key from server. Please re-login to initialize your vault.');
+    }
+    return null;
+  }
+
+  document.getElementById('refresh-dek')?.addEventListener('click', async function (e) {
+    e.preventDefault();
+    const dek = await fetchDek();
+    if (dek) {
+      alert('Vault key is available for client-side encryption. You can now check Encrypt on client before submit.');
+      document.getElementById('clientEncrypt').removeAttribute('disabled');
+    } else {
+      alert('Vault key not available. Please log out and log in again to initialize your vault.');
+    }
+  });
+  const data = await r.json();
+  return data.dek;
+}
+
+async function encryptContent(dekB64, plaintext) {
+  const keyBytes = Uint8Array.from(atob(dekB64.replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0));
+  const key = await crypto.subtle.importKey('raw', keyBytes, 'AES-GCM', false, ['encrypt']);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const enc = new TextEncoder();
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, enc.encode(plaintext));
+  // return base64 of iv + ct
+  const combined = new Uint8Array(iv.byteLength + ct.byteLength);
+  combined.set(iv, 0);
+  combined.set(new Uint8Array(ct), iv.byteLength);
+  return btoa(String.fromCharCode(...combined));
+}
+
+document.getElementById('create-form').addEventListener('submit', async function (e) {
+  const useClientEnc = document.getElementById('clientEncrypt').checked;
+  if (!useClientEnc) return true;
+  e.preventDefault();
+  const dekB64 = await fetchDek();
+  if (!dekB64) {
+    alert('Could not fetch encryption key from server.');
+    return;
+  }
+  const contentEl = document.getElementById('id_content');
+  const plaintext = contentEl.value;
+  const ciphertext = await encryptContent(dekB64, plaintext);
+  contentEl.value = ciphertext; // replace content with ciphertext base64
+  document.getElementById('is_ciphertext').value = '1';
+  this.submit();
+});
+</script>
+{% endblock %}
+
+{% endblock %}

@@ -1,0 +1,18 @@
+/* Custom styles for SecurePad */
+.text-truncate {
+  max-height: 3em; /* to keep cards compact if content is large */
+  overflow: hidden;
+}
+
+.card-title a { color: inherit; }
+.card-title a:hover { text-decoration: none; }
+
+.secret-value { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, 'Roboto Mono', 'Courier New', monospace; }
+
+/* Minor spacing adjustments */
+.card { border-radius: 8px; }
+/* Sticky footer layout – body as column flex container */
+html, body { height: 100%; }
+body { display: flex; flex-direction: column; min-height: 100vh; }
+main.container { flex: 1 0 auto; }
+footer { flex-shrink: 0; }

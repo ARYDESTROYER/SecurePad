@@ -1,0 +1,56 @@
+{% extends 'vault/base.html' %}
+
+{% block title %}Dashboard — SecurePad{% endblock %}
+
+{% block content %}
+<div class="row align-items-center mb-3">
+    <div class="col-md-6">
+        <h1 class="h3 mb-0">Your Notes & Secrets</h1>
+        <div class="text-muted">Logged in as: {{ request.user.username }}</div>
+    </div>
+    <div class="col-md-4">
+        <form method="get" class="d-flex" role="search">
+            <input name="q" class="form-control me-2" type="search" placeholder="Search notes or secrets" aria-label="Search" value="{{ request.GET.q|default_if_none:'' }}">
+            <button class="btn btn-outline-secondary" type="submit">Search</button>
+        </form>
+    </div>
+    <div class="col-md-2 text-md-end mt-2 mt-md-0">
+        <a class="btn btn-outline-primary" href="{% url 'vault:create_item' %}"><i class="bi bi-plus-lg"></i> Add Item</a>
+    </div>
+</div>
+{% if not dek_present and encrypted_count > 0 %}
+<div class="alert alert-warning">Your vault is locked — re-login to initialize and decrypt your notes.</div>
+{% endif %}
+
+<div class="mb-2 text-muted">{{ items.count }} items</div>
+{% if items %}
+<div class="row g-3">
+    {% for item in items %}
+    <div class="col-md-6 col-lg-4">
+        <div class="card h-100 shadow-sm {% if item.item_type == 'SECRET' %}border-start border-danger{% endif %}">
+            <div class="card-body">
+                <h5 class="card-title"><a class="stretched-link text-decoration-none" href="{% url 'vault:item_detail' item.pk %}">{{ item.title }}</a></h5>
+                <p class="card-subtitle text-muted small">
+                    {% if item.item_type == 'NOTE' %}
+                        <i class="bi bi-file-earmark-text"></i>
+                    {% elif item.item_type == 'SECRET' %}
+                        <i class="bi bi-key"></i>
+                    {% else %}
+                        <i class="bi bi-gear"></i>
+                    {% endif %}
+                    {{ item.get_item_type_display }} &middot; <span class="text-muted">{{ item.created_at|date:'M d, Y H:i' }}</span></p>
+                <p class="mt-2 text-truncate">{{ item.decrypted_display }}</p>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% else %}
+<div class="card shadow-sm">
+    <div class="card-body">
+        <p class="mb-0">No items yet. Use <a href="/admin/">admin</a> to add your first secret, note, or env variable.</p>
+    </div>
+  </div>
+{% endif %}
+
+{% endblock %}
