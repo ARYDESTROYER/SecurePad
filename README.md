@@ -8,7 +8,6 @@ Features
 - User authentication (Django auth) with login and logout.
 - Per-user encryption using a server-side DEK encrypted by a password-derived key.
 - Optional client-side AES-GCM encryption for creating secrets.
-- One-time decrypting banner after login (auto-dismisses).
 - Admin safeguards so users can only see their own items.
 - Bootstrap-powered responsive UI.
 
