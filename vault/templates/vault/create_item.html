@@ -20,6 +20,7 @@
             {% endif %}
           </div>
           <input type="hidden" name="is_ciphertext" id="is_ciphertext" value="0">
+          <input type="hidden" name="submission_id" id="submission_id" value="">
           <button class="btn btn-primary" type="submit">Create</button>
         </form>
       </div>
@@ -30,8 +31,19 @@
 {% block scripts %}
 {{ block.super }}
   <script>
-  async function fetchDek() {
-  const r = await fetch('{% url "vault:get_raw_dek" %}');
+    document.addEventListener('DOMContentLoaded', function () {
+      // Ensure a unique submission id to prevent duplicate POSTs
+      const sidEl = document.getElementById('submission_id');
+      if (sidEl && !sidEl.value) {
+        if (window.crypto && window.crypto.randomUUID) {
+          sidEl.value = window.crypto.randomUUID();
+        } else {
+          // fallback random string
+          sidEl.value = 'sid-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+        }
+      }
+    async function fetchDek() {
+      const r = await fetch('{% url "vault:get_raw_dek" %}');
   if (!r.ok) {
     // Attempt to provide a friendly message and fallback
     const ek = await fetch('{% url "vault:get_encrypted_dek" %}');
@@ -44,22 +56,32 @@
     return null;
   }
 
-  document.getElementById('refresh-dek')?.addEventListener('click', async function (e) {
-    e.preventDefault();
-    const dek = await fetchDek();
-    if (dek) {
-      alert('Vault key is available for client-side encryption. You can now check Encrypt on client before submit.');
-      document.getElementById('clientEncrypt').removeAttribute('disabled');
-    } else {
-      alert('Vault key not available. Please log out and log in again to initialize your vault.');
-    }
-  });
+    document.getElementById('refresh-dek')?.addEventListener('click', async function (e) {
+      e.preventDefault();
+      const dek = await fetchDek();
+      if (dek) {
+        alert('Vault key is available for client-side encryption. You can now check Encrypt on client before submit.');
+        document.getElementById('clientEncrypt').removeAttribute('disabled');
+      } else {
+        alert('Vault key not available. Please log out and log in again to initialize your vault.');
+      }
+    });
   const data = await r.json();
   return data.dek;
 }
 
 async function encryptContent(dekB64, plaintext) {
-  const keyBytes = Uint8Array.from(atob(dekB64.replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0));
+  // Convert the URL-safe base64 string returned by the server into a padded standard base64 string
+  function urlBase64ToBase64(urlBase64) {
+    let b64 = urlBase64.replace(/-/g, '+').replace(/_/g, '/');
+    // Add padding if necessary
+    while (b64.length % 4 !== 0) {
+      b64 += '=';
+    }
+    return b64;
+  }
+  const b64 = urlBase64ToBase64(dekB64);
+  const keyBytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
   const key = await crypto.subtle.importKey('raw', keyBytes, 'AES-GCM', false, ['encrypt']);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const enc = new TextEncoder();
@@ -71,22 +93,36 @@ async function encryptContent(dekB64, plaintext) {
   return btoa(String.fromCharCode(...combined));
 }
 
-document.getElementById('create-form').addEventListener('submit', async function (e) {
+    document.getElementById('create-form')?.addEventListener('submit', async function (e) {
   const useClientEnc = document.getElementById('clientEncrypt').checked;
-  if (!useClientEnc) return true;
+      // Disable submit button to avoid double-submission
+      const submitButton = this.querySelector('button[type=submit]');
+      if (submitButton) {
+        submitButton.disabled = true;
+      }
+      if (!useClientEnc) return true;
   e.preventDefault();
   const dekB64 = await fetchDek();
-  if (!dekB64) {
+      if (!dekB64) {
     alert('Could not fetch encryption key from server.');
-    return;
+        if (submitButton) submitButton.disabled = false;
+        return;
   }
   const contentEl = document.getElementById('id_content');
-  const plaintext = contentEl.value;
-  const ciphertext = await encryptContent(dekB64, plaintext);
-  contentEl.value = ciphertext; // replace content with ciphertext base64
-  document.getElementById('is_ciphertext').value = '1';
+      try {
+        const plaintext = contentEl.value;
+        const ciphertext = await encryptContent(dekB64, plaintext);
+        contentEl.value = ciphertext; // replace content with ciphertext base64
+        document.getElementById('is_ciphertext').value = '1';
+      } catch (err) {
+        alert('Encryption failed on client: ' + (err && err.message));
+        if (submitButton) submitButton.disabled = false;
+        return;
+      }
   this.submit();
-});
+    });
+  });
+</script>
 </script>
 {% endblock %}
 

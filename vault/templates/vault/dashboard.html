@@ -15,7 +15,11 @@
         </form>
     </div>
     <div class="col-md-2 text-md-end mt-2 mt-md-0">
+        {% if not dek_present and encrypted_count > 0 %}
+        <button type="button" class="btn btn-outline-primary" data-bs-toggle="modal" data-bs-target="#reauthModal" title="Your vault is locked — re-authenticate to add items"><i class="bi bi-plus-lg"></i> Add Item</button>
+        {% else %}
         <a class="btn btn-outline-primary" href="{% url 'vault:create_item' %}"><i class="bi bi-plus-lg"></i> Add Item</a>
+        {% endif %}
     </div>
 </div>
 {% if not dek_present and encrypted_count > 0 %}
@@ -39,7 +43,10 @@
                         <i class="bi bi-gear"></i>
                     {% endif %}
                     {{ item.get_item_type_display }} &middot; <span class="text-muted">{{ item.created_at|date:'M d, Y H:i' }}</span></p>
-                <p class="mt-2 text-truncate">{{ item.decrypted_display }}</p>
+                <p class="mt-2 text-truncate" data-ciphertext="{{ item.canonical_ciphertext_b64|default_if_none:'' }}">{{ item.decrypted_display }}</p>
+                {% if item.warn_client_ciphertext %}
+                    <div class="small text-warning">This item appears to contain client-side ciphertext stored in the plaintext column. Admin or user migration recommended.</div>
+                {% endif %}
             </div>
         </div>
     </div>
@@ -53,4 +60,151 @@
   </div>
 {% endif %}
 
+{% endblock %}
+
+{% block scripts %}
+<script>
+function urlBase64ToBase64(urlBase64) {
+    let b64 = urlBase64.replace(/-/g, '+').replace(/_/g, '/');
+    while (b64.length % 4 !== 0) {
+        b64 += '=';
+    }
+    return b64;
+}
+
+async function ensureDek() {
+    try {
+        const resp = await fetch('{% url "vault:get_raw_dek" %}');
+        if (!resp.ok) return null;
+        const data = await resp.json();
+        return data.dek;
+    } catch (err) {
+        return null;
+    }
+}
+
+async function tryDecryptCards(dekB64) {
+    if (!dekB64 || !window.crypto?.subtle) return;
+    const keyBytes = Uint8Array.from(atob(urlBase64ToBase64(dekB64)), c => c.charCodeAt(0));
+    let key;
+    try {
+        key = await crypto.subtle.importKey('raw', keyBytes, 'AES-GCM', false, ['decrypt']);
+    } catch (err) {
+        return;
+    }
+    const cards = document.querySelectorAll('[data-ciphertext]');
+    const decoder = new TextDecoder();
+    for (const el of cards) {
+        const ct = (el.getAttribute('data-ciphertext') || '').trim();
+        if (!ct) continue;
+        const current = (el.textContent || '').trim();
+        if (!current || /[A-Za-z0-9+/=]{24,}/.test(current)) {
+            try {
+                const padded = urlBase64ToBase64(ct.replace(/\s+/g, ''));
+                const bytes = Uint8Array.from(atob(padded), c => c.charCodeAt(0));
+                if (bytes.byteLength <= 12) continue;
+                const iv = bytes.slice(0, 12);
+                const ciphertext = bytes.slice(12);
+                const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+                el.textContent = decoder.decode(pt);
+                el.removeAttribute('data-ciphertext');
+            } catch (err) {
+                continue;
+            }
+        }
+    }
+}
+
+// Re-auth modal flow for reinitializing the vault DEK without full logout
+document.addEventListener('DOMContentLoaded', function () {
+        const shouldShow = {% if not dek_present and encrypted_count > 0 %}true{% else %}false{% endif %};
+        if (!shouldShow) return;
+        // Create modal HTML if not present
+        const existing = document.getElementById('reauthModal');
+        if (!existing) {
+                const modalContainer = document.createElement('div');
+                modalContainer.innerHTML = `
+                <div class="modal fade" id="reauthModal" tabindex="-1" aria-labelledby="reauthModalLabel" aria-hidden="true">
+                    <div class="modal-dialog modal-dialog-centered">
+                        <div class="modal-content">
+                            <div class="modal-header">
+                                <h5 class="modal-title" id="reauthModalLabel">Session expired</h5>
+                                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                            </div>
+                            <div class="modal-body">
+                                <p>You've been inactive for too long, and your vault decryption key has expired.</p>
+                                <p>To re-initialize your vault without logging out, please enter your password below.</p>
+                                <div id="reauth-error" class="alert alert-danger d-none" role="alert"></div>
+                                <div class="mb-3">
+                                    <label for="reauth-password" class="form-label">Password</label>
+                                    <input type="password" class="form-control" id="reauth-password" placeholder="Enter password">
+                                </div>
+                            </div>
+                            <div class="modal-footer">
+                                <button type="button" class="btn btn-secondary" id="reauth-cancel" data-bs-dismiss="modal">Back to dashboard</button>
+                                <button type="button" class="btn btn-primary" id="reauth-submit">Unlock Vault</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>`;
+                document.body.appendChild(modalContainer);
+        }
+        const reauthModalEl = document.getElementById('reauthModal');
+        const reauthModal = new bootstrap.Modal(reauthModalEl);
+        reauthModal.show();
+
+        function getCookie(name) {
+                let cookieValue = null;
+                if (document.cookie && document.cookie !== '') {
+                        const cookies = document.cookie.split(';');
+                        for (let i = 0; i < cookies.length; i++) {
+                                const cookie = cookies[i].trim();
+                                if (cookie.substring(0, name.length + 1) === (name + '=')) {
+                                        cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+                                        break;
+                                }
+                        }
+                }
+                return cookieValue;
+        }
+
+        document.getElementById('reauth-submit').addEventListener('click', async function (e) {
+                const pwd = document.getElementById('reauth-password').value || '';
+                const errorBox = document.getElementById('reauth-error');
+                errorBox.classList.add('d-none');
+                const csrftoken = getCookie('csrftoken');
+                try {
+                        const resp = await fetch('{% url "vault:reauth_vault" %}', {
+                                method: 'POST',
+                                headers: {
+                                        'Content-Type': 'application/x-www-form-urlencoded',
+                                        'X-CSRFToken': csrftoken
+                                },
+                                body: `password=${encodeURIComponent(pwd)}`
+                        });
+                        if (!resp.ok) {
+                                const data = await resp.json().catch(() => ({}));
+                                const msg = data.error || 'Failed to re-authenticate';
+                                errorBox.textContent = msg;
+                                errorBox.classList.remove('d-none');
+                                return;
+                        }
+                        // Success, reload to show decrypted content
+                        window.location.reload();
+                } catch (err) {
+                        errorBox.textContent = 'Could not contact server';
+                        errorBox.classList.remove('d-none');
+                }
+        });
+});
+
+document.addEventListener('DOMContentLoaded', function () {
+        (async function(){
+            const dek = await ensureDek();
+            if (dek) {
+                tryDecryptCards(dek);
+            }
+        })();
+});
+</script>
 {% endblock %}

@@ -23,7 +23,7 @@
                     {% if item.item_type == 'SECRET' %}
                         <div id="secret-content" class="mb-3">
                             <button id="toggle-secret" class="btn btn-sm btn-primary mb-2">Show secret</button>
-                            <pre class="secret-value d-none p-3 border rounded bg-light">{{ item.decrypted_display }}</pre>
+                                <pre id="secret-pre" class="secret-value d-none p-3 border rounded bg-light" data-ct="{% if encrypted_b64 %}{{ encrypted_b64 }}{% endif %}">{{ item.decrypted_display }}</pre>
                         </div>
                     {% else %}
                         <pre class="p-3 border rounded bg-light">{{ item.decrypted_display }}</pre>
@@ -34,4 +34,48 @@
     </div>
 </div>
 
+{% endblock %}
+
+{% block scripts %}
+<script>
+function urlBase64ToBase64(urlBase64) {
+    let b64 = urlBase64.replace(/-/g, '+').replace(/_/g, '/');
+    while (b64.length % 4 !== 0) {
+        b64 += '=';
+    }
+    return b64;
+}
+
+async function tryClientDecrypt() {
+    const pre = document.getElementById('secret-pre');
+    if (!pre) return;
+    const ctB64 = pre.dataset.ct;
+    if (!ctB64) return;
+    // If server already decrypted, do nothing
+    if (pre.textContent && pre.textContent.trim() && pre.textContent !== 'Error decrypting') return;
+    try {
+        const r = await fetch('{% url "vault:get_raw_dek" %}');
+        if (!r.ok) return;
+        const data = await r.json();
+        const dekB64 = data.dek;
+        const keyBytes = Uint8Array.from(atob(urlBase64ToBase64(dekB64)), c => c.charCodeAt(0));
+        const key = await crypto.subtle.importKey('raw', keyBytes, 'AES-GCM', false, ['decrypt']);
+        // decode ciphertext into Uint8Array
+        const fullB64 = urlBase64ToBase64(ctB64.replace(/\s+/g, ''));
+        const bytes = Uint8Array.from(atob(fullB64), c => c.charCodeAt(0));
+        const iv = bytes.slice(0,12);
+        const ciphertext = bytes.slice(12);
+        const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+        const dec = new TextDecoder().decode(pt);
+        pre.textContent = dec;
+        pre.classList.remove('d-none');
+    } catch (err) {
+        // decryption failed or not AES-GCM format; ignore silently
+    }
+}
+
+document.addEventListener('DOMContentLoaded', function(){
+    tryClientDecrypt();
+});
+</script>
 {% endblock %}

@@ -9,4 +9,5 @@ urlpatterns = [
     path('create/', views.create_item, name='create_item'),
     path('api/dek/', views.get_encrypted_dek, name='get_encrypted_dek'),
     path('api/raw-dek/', views.get_raw_dek, name='get_raw_dek'),
+    path('reauth/', views.reauth_vault, name='reauth_vault'),
 ]

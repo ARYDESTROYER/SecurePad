@@ -202,3 +202,43 @@ Visit:
 ## Security Note
 
 This is not production-ready code. There is no built-in encryption key management, no secret rotation, and no advanced access control. Review the security considerations and use a production-grade solution and managed secret store for sensitive data in real deployments.
+
+Database / migration utilities
+------------------------------
+SecurePad now protects each POST with a submission token so accidental double-clicks cannot produce duplicate records, and the dashboard tries to decrypt any legacy ciphertext on the client when a DEK is available. If you still have older rows where ciphertext was written into the `content` column, migrate them with the provided management command:
+
+    # Dry-run to preview candidates only
+    python manage.py migrate_content_ciphertext --dry-run
+
+    # Apply migration for detected items
+    python manage.py migrate_content_ciphertext --commit
+
+The command only moves rows where `content_encrypted` is empty and the plaintext column looks like base64. Add `--user <username>` to scope the run or `--min-bytes 32` to adjust heuristics.
+
+Duplicate cleanup
+-----------------
+If you previously ended up with duplicate rows (for example, two entries with the same title where one card shows ciphertext), remove the older copies after reviewing them. One approach is to keep the newest item per `(title, ciphertext)` pair using the Django shell:
+
+```bash
+python manage.py shell <<'PY'
+from vault.models import SecretItem
+from django.contrib.auth.models import User
+
+owner = User.objects.get(username='admin')  # change as needed
+seen = set()
+dupes = []
+for item in SecretItem.objects.filter(owner=owner).order_by('-created_at'):
+    key = (item.title, bytes(item.content_encrypted or b''))
+    if key in seen:
+        dupes.append(item.pk)
+    else:
+        seen.add(key)
+if dupes:
+    SecretItem.objects.filter(pk__in=dupes).delete()
+    print(f"Deleted {len(dupes)} duplicate(s).")
+else:
+    print('No duplicates detected.')
+PY
+```
+
+After cleanup, reload the dashboard. Only the surviving plaintext cards should remain, and newly created entries will not generate duplicates thanks to the submission guard.

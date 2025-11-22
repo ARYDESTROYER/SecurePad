@@ -35,6 +35,28 @@ class SecretItemAdmin(admin.ModelAdmin):
             return qs.filter(owner=request.user)
         return qs.none()
 
+    actions = ['migrate_client_ciphertext']
+
+    def migrate_client_ciphertext(self, request, queryset):
+        import base64
+        migrated = 0
+        for item in queryset:
+            if item.content and not item.content_encrypted:
+                try:
+                    decoded = base64.b64decode(item.content)
+                except Exception:
+                    try:
+                        decoded = base64.urlsafe_b64decode(item.content)
+                    except Exception:
+                        decoded = None
+                if decoded and len(decoded) > 16:
+                    item.content_encrypted = decoded
+                    item.content = ''
+                    item.save(update_fields=['content', 'content_encrypted'])
+                    migrated += 1
+        self.message_user(request, f'Migrated {migrated} item(s)')
+    migrate_client_ciphertext.short_description = 'Migrate selected client ciphertext stored in content into content_encrypted'    
+
     def save_model(self, request, obj, form, change):
         # If content is in plaintext, encrypt with the user's DEK cached in session
         sk = request.session.session_key

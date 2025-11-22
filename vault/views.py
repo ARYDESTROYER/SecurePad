@@ -9,10 +9,64 @@ from .crypto import (generate_dek, decrypt_dek_with_password,
                      encrypt_dek_with_password, decrypt_with_dek)
 from django.contrib.auth import views as auth_views
 from django.http import JsonResponse, HttpResponseForbidden
+from django.shortcuts import redirect
 from django.utils.encoding import force_bytes
 from base64 import b64encode, b64decode
+import base64
+import re
 from .forms import SecretItemForm
 from .crypto import encrypt_with_dek
+from django.views.decorators.http import require_POST
+from django.views.decorators.csrf import ensure_csrf_cookie
+
+
+_BASE64_RE = re.compile(r'^[A-Za-z0-9+/=_-]+$')
+
+
+def _maybe_decode_base64_bytes(value: str):
+    if not value:
+        return None
+    stripped = value.strip()
+    if len(stripped) < 16:
+        return None
+    if not _BASE64_RE.match(stripped):
+        return None
+    try:
+        decoded = b64decode(stripped, validate=True)
+        if len(decoded) >= 16:
+            return decoded
+    except Exception:
+        pass
+    try:
+        pad = '=' * ((4 - len(stripped) % 4) % 4)
+        decoded = base64.urlsafe_b64decode(stripped + pad)
+        if len(decoded) >= 16:
+            return decoded
+    except Exception:
+        return None
+    return None
+
+
+def _ciphertext_context(content_encrypted, content_text):
+    """Return candidates for decryption, canonical base64, and warning flag."""
+    candidates = []
+    canonical_b64 = None
+    warn = False
+    if content_encrypted:
+        binary = bytes(content_encrypted)
+        candidates.append(binary)
+        canonical_b64 = b64encode(binary).decode()
+    text_value = (content_text or '').strip()
+    decoded = _maybe_decode_base64_bytes(text_value)
+    if decoded:
+        warn = True
+        ascii_bytes = text_value.encode()
+        if ascii_bytes and ascii_bytes not in candidates:
+            candidates.append(ascii_bytes)
+        if decoded not in candidates:
+            candidates.append(decoded)
+        canonical_b64 = b64encode(decoded).decode()
+    return candidates, canonical_b64, warn
 
 @login_required
 def dashboard(request):
@@ -31,13 +85,27 @@ def dashboard(request):
         request.session['show_decrypting_shown'] = True
     items = []
     for item in items_qs:
-        if item.content_encrypted and dek:
-            try:
-                item.decrypted_display = decrypt_with_dek(dek, item.content_encrypted)
-            except Exception:
-                item.decrypted_display = '<error decrypting>'
+        candidates, canonical_b64, warn = _ciphertext_context(item.content_encrypted, item.content)
+        item.warn_client_ciphertext = warn
+        decrypted = None
+        if dek and candidates:
+            for candidate in candidates:
+                try:
+                    # candidate may already be ciphertext bytes or ascii base64; try decode when necessary
+                    if isinstance(candidate, str):
+                        candidate_bytes = b64decode(candidate)
+                    else:
+                        candidate_bytes = candidate
+                    decrypted = decrypt_with_dek(dek, candidate_bytes)
+                    break
+                except Exception:
+                    continue
+        if decrypted is not None:
+            item.decrypted_display = decrypted
         else:
+            # If no DEK or decrypt failed, fall back to stored plaintext (which may still be ciphertext-looking)
             item.decrypted_display = item.content or ''
+        item.canonical_ciphertext_b64 = canonical_b64
         items.append(item)
     # Count encrypted items for UI messaging
     encrypted_count = SecretItem.objects.filter(owner=request.user, content_encrypted__isnull=False).count()
@@ -51,14 +119,25 @@ def dashboard(request):
 def item_detail(request, pk):
     item = get_object_or_404(SecretItem, pk=pk, owner=request.user)
     dek = cache.get(f'dek:{request.session.session_key}')
-    if item.content_encrypted and dek:
-        try:
-            item.decrypted_display = decrypt_with_dek(dek, item.content_encrypted)
-        except Exception:
-            item.decrypted_content = '<error decrypting>'
+    candidates, canonical_b64, warn = _ciphertext_context(item.content_encrypted, item.content)
+    encrypted_b64 = canonical_b64
+    decrypted = None
+    if dek and candidates:
+        for candidate in candidates:
+            try:
+                if isinstance(candidate, str):
+                    candidate_bytes = b64decode(candidate)
+                else:
+                    candidate_bytes = candidate
+                decrypted = decrypt_with_dek(dek, candidate_bytes)
+                break
+            except Exception:
+                continue
+    if decrypted is not None:
+        item.decrypted_display = decrypted
     else:
         item.decrypted_display = item.content or ''
-    return render(request, 'vault/item_detail.html', {'item': item})
+    return render(request, 'vault/item_detail.html', {'item': item, 'encrypted_b64': encrypted_b64, 'dek_present': bool(dek)})
 
 
 @login_required
@@ -86,8 +165,48 @@ def get_raw_dek(request):
     dek = cache.get(f'dek:{sk}')
     if not dek:
         return JsonResponse({'error': 'no_dek_in_session'}, status=403)
-    from base64 import b64encode
-    return JsonResponse({'dek': b64encode(dek).decode()})
+    # `dek` is already a urlsafe base64-encoded bytes string (from generate_dek)
+    # Return it as a string without additional base64-encoding so clients get the original URL-safe base64 key.
+    try:
+        # If dek is a bytes-like object containing ascii base64 text, decode it to str.
+        dek_str = dek.decode()
+    except Exception:
+        # Fallback to b64encode if something unexpected is stored
+        from base64 import b64encode
+        dek_str = b64encode(dek).decode()
+    return JsonResponse({'dek': dek_str})
+
+
+@require_POST
+@ensure_csrf_cookie
+@login_required
+def reauth_vault(request):
+    """Re-authenticate to fetch/decrypt and cache the user's DEK for this session.
+
+    Expects: POST with 'password'. Returns JSON with status and possibly message.
+    """
+    password = request.POST.get('password')
+    if not password:
+        return JsonResponse({'error': 'missing_password'}, status=400)
+    try:
+        uv = request.user.vault_profile
+    except Exception:
+        return JsonResponse({'error': 'no_vault_profile'}, status=403)
+    if not uv.dek_encrypted:
+        return JsonResponse({'error': 'no_dek'}, status=403)
+    try:
+        dek = decrypt_dek_with_password(uv.dek_encrypted, password, uv.dek_salt)
+    except Exception:
+        return JsonResponse({'error': 'invalid_password'}, status=403)
+    # Cache decrypted dek for this session
+    sk = request.session.session_key
+    if not sk:
+        request.session.save()
+        sk = request.session.session_key
+    cache.set(f'dek:{sk}', dek, timeout=300)
+    # show the decrypting message once so UI gives feedback
+    request.session['show_decrypting'] = True
+    return JsonResponse({'status': 'ok'})
 
 
 @login_required
@@ -109,6 +228,19 @@ def create_item(request):
                 request.session.save()
                 sk = request.session.session_key
             dek = cache.get(f'dek:{sk}')
+            submission_id = request.POST.get('submission_id') or ''
+            submission_key = None
+            inflight_claimed = False
+            if submission_id:
+                submission_key = f'submission:{submission_id}'
+                cached_value = cache.get(submission_key)
+                if isinstance(cached_value, int):
+                    return redirect('vault:item_detail', pk=cached_value)
+                if cached_value == 'inflight':
+                    messages.info(request, 'Previous submission is still processing. Please wait a moment and refresh.')
+                    return redirect('vault:dashboard')
+                inflight_claimed = cache.add(submission_key, 'inflight', timeout=60)
+
             if is_ciphertext:
                 # Content given already encrypted (base64), store as binary
                 content_b64 = request.POST.get('content', '')
@@ -121,13 +253,34 @@ def create_item(request):
                 if not dek:
                     # If the user's DEK is not present in the session, we refuse to accept plaintext
                     # to prevent storing unencrypted secrets on the server.
+                    if submission_key and inflight_claimed:
+                        cache.delete(submission_key)
                     messages.error(request, 'Your vault is locked; please re-login to initialize your vault before creating plaintext items.')
                     return render(request, 'vault/create_item.html', {'form': form, 'dek_present': False})
                 if dek and obj.content:
                     obj.content_encrypted = encrypt_with_dek(dek, obj.content)
                     obj.content = ''
+            # Check for submission idempotency token to avoid duplicate POSTs
+            if submission_key and not inflight_claimed:
+                existing_pk = cache.get(submission_key)
+                if isinstance(existing_pk, int):
+                    return redirect('vault:item_detail', pk=existing_pk)
+
+            # Prevent duplicate creation: look for an existing item with the same owner/title and encryption
+            existing = None
+            if obj.content_encrypted:
+                existing = SecretItem.objects.filter(owner=request.user, title=obj.title, content_encrypted=obj.content_encrypted).first()
+            else:
+                existing = SecretItem.objects.filter(owner=request.user, title=obj.title, content=obj.content).first()
+            if existing:
+                if submission_key:
+                    cache.set(submission_key, existing.pk, timeout=60)
+                # Redirect to existing item detail
+                return redirect('vault:item_detail', pk=existing.pk)
             obj.save()
-            return render(request, 'vault/item_detail.html', {'item': obj})
+            if submission_key:
+                cache.set(submission_key, obj.pk, timeout=60)
+            return redirect('vault:item_detail', pk=obj.pk)
     else:
         form = SecretItemForm()
     return render(request, 'vault/create_item.html', {'form': form, 'dek_present': dek_present})
